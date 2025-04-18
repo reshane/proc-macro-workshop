@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use syn::{parse_macro_input, Data, DeriveInput, Field, Fields, GenericArgument, Meta, PathArguments, Type};
-use proc_macro2::{Ident, Literal, TokenTree};
+use proc_macro2::{Ident, TokenTree};
 use quote::quote;
 use std::ops::{Deref, DerefMut};
 
@@ -16,6 +16,7 @@ enum BuilderFieldInfo {
     Extendable{
         full: Field,
         inner_typ: syn::TypePath,
+        tag: Option<String>,
     },
 }
 
@@ -51,24 +52,19 @@ impl BuilderFieldInfo {
             }
         } else if extendable {
             for attr in src_field.attrs.iter() {
-                println!("{:?}", attr);
                 if let Meta::List(ref meta_list) = attr.meta {
                     for token in meta_list.tokens.clone().into_iter() {
                         if let TokenTree::Literal(lit) = token {
-                            tag = Some(format!("{}", lit));
-                            println!("{}", lit);
+                            let trimmed = lit.to_string().trim_matches('"').to_string();
+                            tag = Some(trimmed);
                         }
                     }
                 }
             }
-            /*
-            let identifier = input.ident;
-            let builder_name = format!("{}Builder", identifier);
-            let builder_name_ident = Ident::new(builder_name.as_str(), identifier.span());
-            */
             BuilderFieldInfo::Extendable {
                 full: src_field.clone(),
                 inner_typ: inner_typ.expect("There must be an inner type of a Vec<..> field"),
+                tag,
             }
         } else {
             BuilderFieldInfo::Basic {
@@ -89,7 +85,7 @@ impl BuilderFieldInfo {
                 let typ = &full.ty;
                 quote! { #ident: #typ }
             },
-            BuilderFieldInfo::Extendable { full, inner_typ: _ } => {
+            BuilderFieldInfo::Extendable { full, inner_typ: _, tag: _} => {
                 let ident = &full.ident;
                 let typ = &full.ty;
                 quote! { #ident: #typ }
@@ -107,7 +103,7 @@ impl BuilderFieldInfo {
                 let field = &full.ident;
                 quote! { #field: std::option::Option::None }
             },
-            BuilderFieldInfo::Extendable { full, inner_typ } => {
+            BuilderFieldInfo::Extendable { full, inner_typ, tag: _} => {
                 let field = &full.ident;
                 quote! { #field: std::vec::Vec::<#inner_typ>::new() }
             },
@@ -135,10 +131,18 @@ impl BuilderFieldInfo {
                     }
                 }
             },
-            BuilderFieldInfo::Extendable { full, inner_typ } => {
+            BuilderFieldInfo::Extendable { full, inner_typ, tag } => {
+                let method_ident = match tag {
+                    Some(tag) => {
+                        Ident::new(tag.as_str(), full.ident.clone().unwrap().span())
+                    },
+                    None => {
+                        full.ident.clone().unwrap()
+                    }
+                };
                 let field_ident = &full.ident;
                 quote! {
-                    pub fn #field_ident(&mut self, #field_ident: #inner_typ) -> &mut #builder_name_ident {
+                    pub fn #method_ident(&mut self, #field_ident: #inner_typ) -> &mut #builder_name_ident {
                         self.#field_ident.push(#field_ident);
                         self
                     }
@@ -157,27 +161,10 @@ impl BuilderFieldInfo {
                 let field_ident = &full.ident;
                 quote! { #field_ident: self.#field_ident.clone() }
             },
-            BuilderFieldInfo::Extendable { full, inner_typ: _ } => {
+            BuilderFieldInfo::Extendable { full, inner_typ: _, tag: _ } => {
                 let field_ident = &full.ident;
-                quote! { #field_ident: self.#field_ident }
+                quote! { #field_ident: self.#field_ident.clone() }
             },
-        }
-    }
-
-    fn into_validation(&self) -> proc_macro2::TokenStream {
-        match self {
-            BuilderFieldInfo::Basic { full } => {
-                let field_ident = &full.ident;
-                quote! {
-                    if self.#field_ident.is_none() {
-                        return Err(std::boxed::Box::new(
-                            format!("Missing field {}", stringify!(#field_ident))
-                        ));
-                    }
-                }
-            },
-            BuilderFieldInfo::Optional { full: _, inner_typ: _ } => quote!{},
-            BuilderFieldInfo::Extendable { full: _, inner_typ: _ } => quote!{},
         }
     }
 }
@@ -250,8 +237,40 @@ pub fn derive(input: TokenStream) -> TokenStream {
         .map(|field| field.into_unwrapping() )
         .collect::<Vec<proc_macro2::TokenStream>>();
 
+    let builder_error_name = format!("{}BuilderError", identifier);
+    let builder_error_name_ident = Ident::new(builder_error_name.as_str(), identifier.span());
+    let builder_error = quote! {
+        #[derive(Debug)]
+        pub struct #builder_error_name_ident {
+            inner: String,
+        }
+        impl std::fmt::Display for #builder_error_name_ident {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.inner)
+            }
+        }
+        impl std::error::Error for #builder_error_name_ident {}
+    };
+
     let final_struct_validations = full_fields.iter()
-        .map(|field| field.into_validation() )
+        .filter_map(|field| {
+            match field {
+                BuilderFieldInfo::Basic { full } => {
+                    let field_ident = &full.ident;
+                    Some(quote! {
+                        if self.#field_ident.is_none() {
+                            return Err(std::boxed::Box::new(
+                                #builder_error_name_ident {
+                                    inner: format!("Missing field {}", stringify!(#field_ident))
+                                }
+                            ));
+                        }
+                    })
+                },
+                BuilderFieldInfo::Optional { full: _, inner_typ: _ } => None,
+                BuilderFieldInfo::Extendable { full: _, inner_typ: _, tag: _} => None,
+            }
+        })
         .collect::<Vec<proc_macro2::TokenStream>>();
 
     // builder struct impl
@@ -267,11 +286,13 @@ pub fn derive(input: TokenStream) -> TokenStream {
         }
     };
 
+
     // expand all of it
     let expanded = quote! {
         #builder_fn
         #builder_struct
         #builder_struct_impl
+        #builder_error
     };
     
     expanded.into()
